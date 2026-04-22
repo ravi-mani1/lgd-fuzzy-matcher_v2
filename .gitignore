@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+*.log
+lgd_matcher.log
+lgd_matched_output.csv
+lgd_unmatched.csv
+lgd_updates.sql
+tmp_sql_export.sql
+.env
+venv/
