@@ -168,6 +168,49 @@ def list_districts_safe(matcher: LGDMatcher, state_lgd_code: str) -> list[dict]:
     ddf = ddf[["district_lgd_code", "district_name"]].drop_duplicates().sort_values(["district_name", "district_lgd_code"])
     return ddf.to_dict(orient="records")
 
+def suggest_states_safe(matcher: LGDMatcher, raw_state: str, limit: int = 5) -> list[dict]:
+    suggest_fn = getattr(matcher, "suggest_states", None)
+    if callable(suggest_fn):
+        st.session_state["state_suggest_fallback_used"] = False
+        return suggest_fn(raw_state, limit=limit)
+    st.session_state["state_suggest_fallback_used"] = True
+    match_fn = getattr(matcher, "match_state", None)
+    if not callable(match_fn):
+        return []
+    sm = match_fn(raw_state)
+    sc = sm.get("state_lgd_code")
+    if sc is None:
+        return []
+    return [{
+        "state_lgd_code": sc,
+        "state_name": sm.get("state_name_corrected"),
+        "score": sm.get("state_score", 0.0),
+        "status": sm.get("state_status", "NOT_FOUND"),
+    }]
+
+def suggest_districts_safe(matcher: LGDMatcher, raw_district: str, state_lgd_code: str | None, limit: int = 5) -> list[dict]:
+    suggest_fn = getattr(matcher, "suggest_districts", None)
+    if callable(suggest_fn):
+        st.session_state["district_suggest_fallback_used"] = False
+        return suggest_fn(raw_district, state_lgd_code=state_lgd_code, limit=limit)
+    st.session_state["district_suggest_fallback_used"] = True
+    if not state_lgd_code:
+        return []
+    match_fn = getattr(matcher, "match_district", None)
+    if not callable(match_fn):
+        return []
+    dm = match_fn(raw_district, str(state_lgd_code))
+    dc = dm.get("district_lgd_code")
+    if dc is None:
+        return []
+    return [{
+        "district_lgd_code": dc,
+        "district_name": dm.get("district_name_corrected"),
+        "state_lgd_code": str(state_lgd_code),
+        "score": dm.get("district_score", 0.0),
+        "status": dm.get("district_status", "NOT_FOUND"),
+    }]
+
 with tab0:
     st.subheader("Quick Validate")
     st.caption("Fill any 1–4 fields. You can enter multiple values separated by commas.")
@@ -221,13 +264,13 @@ with tab0:
                 if show_suggestions:
                     sc_best = res.get("state_lgd_code")
                     if r["state_name_in"]:
-                        for s in matcher.suggest_states(r["state_name_in"], limit=top_n):
+                        for s in suggest_states_safe(matcher, r["state_name_in"], limit=top_n):
                             sugg_rows.append({"id": r["id"], "type": "STATE", **s})
                     if r["district_name_in"]:
                         if sc_best:
-                            for d in matcher.suggest_districts(r["district_name_in"], state_lgd_code=sc_best, limit=top_n):
+                            for d in suggest_districts_safe(matcher, r["district_name_in"], state_lgd_code=sc_best, limit=top_n):
                                 sugg_rows.append({"id": r["id"], "type": "DISTRICT_IN_STATE", **d})
-                        for d in matcher.suggest_districts(r["district_name_in"], state_lgd_code=None, limit=top_n):
+                        for d in suggest_districts_safe(matcher, r["district_name_in"], state_lgd_code=None, limit=top_n):
                             sugg_rows.append({"id": r["id"], "type": "DISTRICT_ANY_STATE", **d})
 
             out_df = pd.DataFrame(outputs)
@@ -237,6 +280,8 @@ with tab0:
             if show_suggestions and sugg_rows:
                 st.divider()
                 st.markdown("### Suggestions (for user decision)")
+                if st.session_state.get("state_suggest_fallback_used") or st.session_state.get("district_suggest_fallback_used"):
+                    st.info("Using compatibility suggestion mode (matcher suggestion methods unavailable in this runtime).")
                 st.dataframe(pd.DataFrame(sugg_rows), use_container_width=True, height=360)
 
         st.divider()
@@ -249,7 +294,10 @@ with tab0:
             if sc is None:
                 st.warning("State not found.")
                 if show_suggestions:
-                    st.dataframe(pd.DataFrame(matcher.suggest_states(list_state, limit=top_n)), use_container_width=True, height=220)
+                    srows = suggest_states_safe(matcher, list_state, limit=top_n)
+                    if st.session_state.get("state_suggest_fallback_used"):
+                        st.info("Using compatibility suggestion mode (matcher suggestion methods unavailable in this runtime).")
+                    st.dataframe(pd.DataFrame(srows), use_container_width=True, height=220)
             else:
                 dlist = list_districts_safe(matcher, str(sc))
                 if st.session_state.get("district_list_fallback_used"):
