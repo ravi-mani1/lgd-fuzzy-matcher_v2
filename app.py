@@ -7,6 +7,7 @@ import json
 import hmac
 import base64
 import hashlib
+import uuid
 from collections.abc import Mapping
 import pandas as pd
 import streamlit as st
@@ -14,6 +15,36 @@ from matcher import LGDMatcher
 from utils import generate_sql_update, load_config
 
 st.set_page_config(page_title="LGD Fuzzy Matcher", page_icon="🗺️", layout="wide")
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    payload = {
+        "sessionId": "c95d1a",
+        "runId": f"pre-fix-{st.session_state.get('debug_run_id', 'unknown')}",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    # Keep this tiny and non-blocking for debug mode.
+    try:
+        with open("debug-c95d1a.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:7727/ingest/1e0cafff-2274-484c-b0a9-f1903ea150e9",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Debug-Session-Id": "c95d1a"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=0.2).read()
+    except Exception:
+        pass
+    # endregion
 
 st.markdown("""
 <style>
@@ -170,6 +201,20 @@ def row_style(row):
               "MEDIUM_CONFIDENCE":"#fef3c7","LOW_CONFIDENCE":"#fee2e2","NOT_FOUND":"#f3f4f6"}
     c = colors.get(row.get("match_status",""),"")
     return [f"background-color:{c}"]*len(row)
+
+def suggestion_row_style(row):
+    t = str(row.get("type", ""))
+    if "PREFIX" in t or "ALL" in t:
+        c = "#dcfce7"
+    elif "IN_STATE" in t:
+        c = "#dbeafe"
+    elif "ANY_STATE" in t:
+        c = "#fef3c7"
+    elif t == "STATE":
+        c = "#e0e7ff"
+    else:
+        c = "#f9fafb"
+    return [f"background-color:{c}"] * len(row)
 
 
 def to_csv(df): return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -373,9 +418,25 @@ def suggest_districts_safe(matcher: LGDMatcher, raw_district: str, state_lgd_cod
         "status": dm.get("district_status", "NOT_FOUND"),
     }]
 
+def district_prefix_list_in_state(matcher: LGDMatcher, state_lgd_code: str, prefix: str) -> list[dict]:
+    districts = list_districts_safe(matcher, state_lgd_code)
+    p = (prefix or "").strip().lower()
+    if not p:
+        return districts
+    return [d for d in districts if str(d.get("district_name", "")).strip().lower().startswith(p)]
+
 with tab0:
     st.subheader("Quick Validate")
     st.caption("Fill any 1–4 fields. You can enter multiple values separated by commas.")
+    st.info("Supported combinations: state/district name, state/district LGD code, or any mix. If exact mapping is not possible, suggestions are shown.")
+    st.markdown(
+        "<span style='background:#dcfce7;padding:2px 8px;border-radius:6px;'>EXACT</span> "
+        "<span style='background:#dbeafe;padding:2px 8px;border-radius:6px;'>HIGH</span> "
+        "<span style='background:#fef3c7;padding:2px 8px;border-radius:6px;'>MEDIUM</span> "
+        "<span style='background:#fee2e2;padding:2px 8px;border-radius:6px;'>LOW</span> "
+        "<span style='background:#f3f4f6;padding:2px 8px;border-radius:6px;'>NOT_FOUND</span>",
+        unsafe_allow_html=True,
+    )
 
     matcher = load_matcher_from_sources()
     if matcher is None:
@@ -391,11 +452,44 @@ with tab0:
 
         run_quick = st.button("Validate", type="primary")
         if run_quick:
+            st.session_state["debug_run_id"] = str(uuid.uuid4())
             rows = build_rows(q_state_name, q_state_lgd, q_dist_name, q_dist_lgd)
+            _debug_log(
+                "H1",
+                "app.py:quick_validate_start",
+                "Quick validate input snapshot",
+                {
+                    "rows_count": len(rows),
+                    "state_name": q_state_name,
+                    "district_name": q_dist_name,
+                    "state_lgd": q_state_lgd,
+                    "district_lgd": q_dist_lgd,
+                },
+            )
             outputs = []
             sugg_rows = []
 
             for r in rows:
+                has_state_name = bool((r["state_name_in"] or "").strip())
+                has_state_lgd = bool((r["state_lgd_in"] or "").strip())
+                has_dist_name = bool((r["district_name_in"] or "").strip())
+                has_dist_lgd = bool((r["district_lgd_in"] or "").strip())
+
+                if not any([has_state_name, has_state_lgd, has_dist_name, has_dist_lgd]):
+                    outputs.append({
+                        "id": r["id"],
+                        "state_name_raw": "",
+                        "district_name_raw": "",
+                        "state_lgd_code": None,
+                        "state_name_corrected": None,
+                        "district_lgd_code": None,
+                        "district_name_corrected": None,
+                        "match_confidence_score": 0.0,
+                        "match_status": "NOT_FOUND",
+                        "resolution_note": "No input provided in this row.",
+                    })
+                    continue
+
                 # Resolve from LGD codes if provided (these are exact validations)
                 state_by_code = state_from_lgd(matcher, r["state_lgd_in"])
                 district_by_code = district_from_lgd(matcher, r["district_lgd_in"], state_lgd_code=r["state_lgd_in"] or None)
@@ -404,6 +498,21 @@ with tab0:
                     inferred_state_from_district = state_from_lgd(matcher, district_by_code.get("state_lgd_code"))
                     if inferred_state_from_district:
                         state_by_code = inferred_state_from_district
+                _debug_log(
+                    "H2",
+                    "app.py:quick_validate_code_resolution",
+                    "Code lookup results",
+                    {
+                        "row_id": r["id"],
+                        "state_lgd_in": r["state_lgd_in"],
+                        "district_lgd_in": r["district_lgd_in"],
+                        "state_by_code_found": bool(state_by_code),
+                        "district_by_code_found": bool(district_by_code),
+                        "inferred_state_from_district": bool(inferred_state_from_district),
+                        "district_by_code_state_lgd": (district_by_code or {}).get("state_lgd_code"),
+                        "district_by_code_name": (district_by_code or {}).get("district_name"),
+                    },
+                )
 
                 # Prefer user-provided state name; else use state name from state LGD code; else blank
                 state_name_raw = (r["state_name_in"] or (state_by_code["state_name"] if state_by_code else "")).strip()
@@ -426,6 +535,21 @@ with tab0:
                 else:
                     res["district_state_mismatch"] = False if (district_by_code and state_by_code) else None
 
+                note_parts = []
+                if has_state_lgd and not state_by_code:
+                    note_parts.append("State LGD code not found.")
+                if has_dist_lgd and not district_by_code:
+                    note_parts.append("District LGD code not found (or not in the given state).")
+                if res.get("district_state_mismatch"):
+                    note_parts.append("State LGD and District LGD belong to different states.")
+                if district_by_code and inferred_state_from_district:
+                    note_parts.append("State inferred from district LGD code.")
+                if not note_parts and (has_state_lgd or has_dist_lgd):
+                    note_parts.append("Resolved using provided LGD code(s).")
+                if not note_parts and (has_state_name or has_dist_name):
+                    note_parts.append("Resolved using name matching.")
+                res["resolution_note"] = " ".join(note_parts)
+
                 # If LGD codes are valid, treat them as authoritative and lock exact output.
                 if district_by_code and state_by_code and not res.get("district_state_mismatch"):
                     res["state_lgd_code"] = state_by_code["state_lgd_code"]
@@ -434,18 +558,83 @@ with tab0:
                     res["district_name_corrected"] = district_by_code["district_name"]
                     res["match_confidence_score"] = 100.0
                     res["match_status"] = "EXACT"
+                _debug_log(
+                    "H3",
+                    "app.py:quick_validate_final_row",
+                    "Quick validate output row",
+                    {
+                        "row_id": r["id"],
+                        "match_status": res.get("match_status"),
+                        "state_lgd_code": res.get("state_lgd_code"),
+                        "district_lgd_code": res.get("district_lgd_code"),
+                        "state_name_corrected": res.get("state_name_corrected"),
+                        "district_name_corrected": res.get("district_name_corrected"),
+                        "district_state_mismatch": res.get("district_state_mismatch"),
+                    },
+                )
 
                 outputs.append(res)
 
+                sc_best = res.get("state_lgd_code")
+                has_state_scoped_need = bool(sc_best and ((r["district_name_in"] or "").strip() or not (r["district_name_in"] or "").strip()))
+                _debug_log(
+                    "H6",
+                    "app.py:suggestions_branch_gate",
+                    "Suggestion branch gate values",
+                    {
+                        "row_id": r["id"],
+                        "show_suggestions": bool(show_suggestions),
+                        "state_lgd_code_best": sc_best,
+                        "district_name_in": r["district_name_in"],
+                        "state_scoped_need": has_state_scoped_need,
+                    },
+                )
+
+                # Always produce state-scoped district options when a state is resolved.
+                # This keeps quick-validate useful even if "Show suggestions" is off.
+                if sc_best:
+                    if r["district_name_in"]:
+                        pref_rows = district_prefix_list_in_state(matcher, str(sc_best), r["district_name_in"])
+                        _debug_log(
+                            "H7",
+                            "app.py:district_prefix_rows",
+                            "State-scoped prefix rows generated",
+                            {"row_id": r["id"], "state_lgd_code": str(sc_best), "prefix": r["district_name_in"], "count": len(pref_rows)},
+                        )
+                        if pref_rows:
+                            for d in pref_rows:
+                                sugg_rows.append({
+                                    "id": r["id"],
+                                    "type": "DISTRICT_IN_STATE_PREFIX",
+                                    "district_lgd_code": d.get("district_lgd_code"),
+                                    "district_name": d.get("district_name"),
+                                    "state_lgd_code": str(sc_best),
+                                })
+                        elif show_suggestions:
+                            for d in suggest_districts_safe(matcher, r["district_name_in"], state_lgd_code=sc_best, limit=top_n):
+                                sugg_rows.append({"id": r["id"], "type": "DISTRICT_IN_STATE", **d})
+                    else:
+                        all_rows = district_prefix_list_in_state(matcher, str(sc_best), "")
+                        _debug_log(
+                            "H7",
+                            "app.py:district_all_rows",
+                            "State-scoped all-district rows generated",
+                            {"row_id": r["id"], "state_lgd_code": str(sc_best), "count": len(all_rows)},
+                        )
+                        for d in all_rows:
+                            sugg_rows.append({
+                                "id": r["id"],
+                                "type": "DISTRICT_IN_STATE_ALL",
+                                "district_lgd_code": d.get("district_lgd_code"),
+                                "district_name": d.get("district_name"),
+                                "state_lgd_code": str(sc_best),
+                            })
+
                 if show_suggestions:
-                    sc_best = res.get("state_lgd_code")
                     if r["state_name_in"]:
                         for s in suggest_states_safe(matcher, r["state_name_in"], limit=top_n):
                             sugg_rows.append({"id": r["id"], "type": "STATE", **s})
-                    if r["district_name_in"]:
-                        if sc_best:
-                            for d in suggest_districts_safe(matcher, r["district_name_in"], state_lgd_code=sc_best, limit=top_n):
-                                sugg_rows.append({"id": r["id"], "type": "DISTRICT_IN_STATE", **d})
+                    if not sc_best and r["district_name_in"]:
                         for d in suggest_districts_safe(matcher, r["district_name_in"], state_lgd_code=None, limit=top_n):
                             sugg_rows.append({"id": r["id"], "type": "DISTRICT_ANY_STATE", **d})
 
@@ -459,14 +648,21 @@ with tab0:
                 c3.metric("MEDIUM", int(counts.get("MEDIUM_CONFIDENCE", 0)))
                 c4.metric("LOW", int(counts.get("LOW_CONFIDENCE", 0)))
                 c5.metric("NOT FOUND", int(counts.get("NOT_FOUND", 0)))
-            st.dataframe(out_df, use_container_width=True, height=320)
+            st.dataframe(out_df.style.apply(row_style, axis=1), use_container_width=True, height=320)
 
-            if show_suggestions and sugg_rows:
+            _debug_log(
+                "H8",
+                "app.py:suggestions_render_gate",
+                "Suggestions render gate values",
+                {"show_suggestions": bool(show_suggestions), "sugg_rows_count": len(sugg_rows)},
+            )
+            if sugg_rows:
                 st.divider()
                 st.markdown("### Suggestions (for user decision)")
                 if st.session_state.get("state_suggest_fallback_used") or st.session_state.get("district_suggest_fallback_used"):
                     st.info("Using compatibility suggestion mode (matcher suggestion methods unavailable in this runtime).")
-                st.dataframe(pd.DataFrame(sugg_rows), use_container_width=True, height=360)
+                sugg_df = pd.DataFrame(sugg_rows)
+                st.dataframe(sugg_df.style.apply(suggestion_row_style, axis=1), use_container_width=True, height=360)
 
         st.divider()
         st.subheader("List all districts of a state")

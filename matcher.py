@@ -1,6 +1,9 @@
 """matcher.py - Core LGD Fuzzy Matching Engine."""
 from __future__ import annotations
 import logging
+import json
+import time
+import urllib.request
 from functools import lru_cache
 from typing import Any, Optional
 import pandas as pd
@@ -8,6 +11,29 @@ from rapidfuzz import fuzz, process
 from utils import load_config, normalize_alias_map, normalize_text, is_blank
 
 logger = logging.getLogger("lgd_matcher")
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    payload = {
+        "sessionId": "c95d1a",
+        "runId": "pre-fix-runtime",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:7727/ingest/1e0cafff-2274-484c-b0a9-f1903ea150e9",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Debug-Session-Id": "c95d1a"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=0.2).read()
+    except Exception:
+        pass
+    # endregion
 
 
 class LGDMatcher:
@@ -267,6 +293,18 @@ class LGDMatcher:
         norm = normalize_text(raw, self.stop_words)
         if not norm: return empty
         sc = "" if is_blank(state_lgd_code) else str(state_lgd_code).strip()
+        _debug_log(
+            "H4",
+            "matcher.py:match_district_entry",
+            "District match called",
+            {
+                "raw_district": raw,
+                "normalized_district": norm,
+                "state_lgd_code_in": state_lgd_code,
+                "state_lgd_code_normalized": sc,
+                "global_mode": (not bool(sc)),
+            },
+        )
 
         exact_map = self.district_exact_by_state.get(sc, {}) if sc else self.global_district_exact_map
         norm_map  = self.district_norm_by_state.get(sc, {})  if sc else self.global_district_norm_map
@@ -301,11 +339,29 @@ class LGDMatcher:
         # If state is unknown, avoid "guessing" districts via fuzzy search.
         # Use suggest_districts() to guide the user instead.
         if global_mode:
+            _debug_log(
+                "H5",
+                "matcher.py:match_district_global_mode_return",
+                "Global mode returns NOT_FOUND without fuzzy matching",
+                {"raw_district": raw, "normalized_district": norm},
+            )
             return empty
 
         choice, score = self._best_fuzzy(query, choices)
         if choice is None or score < self.thresholds["low_confidence"]: return empty
         if cand := _get(norm_map, choice):
+            _debug_log(
+                "H4",
+                "matcher.py:match_district_success",
+                "District fuzzy match succeeded",
+                {
+                    "raw_district": raw,
+                    "state_lgd_code": sc,
+                    "choice": choice,
+                    "score": score,
+                    "district_lgd_code": cand.get("district_lgd_code"),
+                },
+            )
             return {"district_lgd_code": cand["district_lgd_code"], "district_name_corrected": cand["district_name"],
                     "district_score": round(score, 2), "district_status": self._status(score)}
         return empty
