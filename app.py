@@ -3,6 +3,8 @@ app.py - Streamlit UI for LGD Fuzzy Matcher
 Run: streamlit run app.py
 """
 import io, os, time
+import json
+import hmac
 import pandas as pd
 import streamlit as st
 from matcher import LGDMatcher
@@ -31,6 +33,57 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+def _load_auth_users() -> dict[str, str]:
+    users: dict[str, str] = {}
+    try:
+        secret_users = st.secrets.get("auth_users", {})
+        if isinstance(secret_users, dict):
+            for k, v in secret_users.items():
+                u = str(k).strip()
+                p = str(v).strip()
+                if u and p:
+                    users[u] = p
+    except Exception:
+        pass
+    env_json = os.getenv("LGD_AUTH_USERS_JSON", "").strip()
+    if env_json:
+        try:
+            parsed = json.loads(env_json)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    u = str(k).strip()
+                    p = str(v).strip()
+                    if u and p:
+                        users[u] = p
+        except Exception:
+            pass
+    return users
+
+def _render_auth_gate() -> None:
+    if st.session_state.get("auth_ok"):
+        return
+    users = _load_auth_users()
+    st.title("🔐 Authorized Access")
+    st.caption("Sign in to use the LGD Fuzzy Matcher.")
+    if not users:
+        st.error("No authorized users configured. Set `auth_users` in Streamlit secrets or `LGD_AUTH_USERS_JSON` in environment.")
+        st.stop()
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Sign in", type="primary")
+    if submit:
+        expected = users.get(str(username).strip())
+        if expected and hmac.compare_digest(str(password), expected):
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = str(username).strip()
+            st.success("Login successful.")
+            st.rerun()
+        st.error("Invalid username or password.")
+    st.stop()
+
+_render_auth_gate()
+
 @st.cache_resource(show_spinner="Building indices...")
 def get_matcher_from_bytes(state_bytes: bytes, district_bytes: bytes) -> LGDMatcher:
     m = LGDMatcher(config_path="config.json")
@@ -57,6 +110,11 @@ def to_sql(df, table):
 
 with st.sidebar:
     st.title("🗺️ LGD Fuzzy Matcher")
+    st.caption(f"Signed in as: **{st.session_state.get('auth_user', 'unknown')}**")
+    if st.button("Sign out", use_container_width=True):
+        st.session_state["auth_ok"] = False
+        st.session_state["auth_user"] = ""
+        st.rerun()
     st.caption("Indian Local Government Directory")
     st.divider()
     st.subheader("Master Data Source")
